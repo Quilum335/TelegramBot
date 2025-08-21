@@ -2,6 +2,7 @@
 
 import re
 
+
 def clean_post_content(text, donor_channel=None):
     """
     Очищает текст поста от ссылок на исходный канал, сохраняя структуру
@@ -58,4 +59,19 @@ def clean_post_content(text, donor_channel=None):
     # Убираем пробелы в начале и конце
     text = text.strip()
     
+    return text
+
+
+def clean_telegram_links(text: str) -> str:
+    """Удаляет ссылки/упоминания телеграм-каналов из текста, сохраняя форматирование.
+    - Удаляет t.me/telegram.me ссылки
+    - Удаляет @username как отдельные токены
+    - Не схлопывает пробелы и не меняет переводы строк
+    """
+    if not text:
+        return text
+    # Удаляем ссылки на Telegram каналы/приглашения в любом месте текста
+    text = re.sub(r'(https?://)?t(?:elegram)?\.me/[A-Za-z0-9_+/]+', '', text)
+    # Удаляем @username, но только когда это отдельный токен (не часть email)
+    text = re.sub(r'(?<!\S)@[A-Za-z0-9_]{3,}(?!\S)', '', text)
     return text 
