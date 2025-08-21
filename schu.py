@@ -91,6 +91,24 @@ class PostScheduler:
         await client.start()
         self._client_cache[session_string] = client
         return client
+        
+    async def _resolve_session_string(self, is_public: bool, phone_number: Optional[str], db_path: str) -> Optional[str]:
+        """Возвращает подходящий session_string для операций от имени аккаунта.
+        При is_public=True или отсутствии телефона используется основная сессия.
+        Иначе берём session_string из таблицы linked_accounts по номеру телефона.
+        """
+        try:
+            if is_public or not phone_number:
+                return self.session_string
+            async with aiosqlite.connect(db_path) as db:
+                cursor = await db.execute(
+                    "SELECT session_string FROM linked_accounts WHERE phone_number = ?",
+                    (phone_number,)
+                )
+                row = await cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception:
+            return None
 
     async def _stop_all_clients(self):
         for client in list(self._client_cache.values()):
@@ -483,19 +501,7 @@ class PostScheduler:
         """Получение случайного поста из канала-донора"""
         try:
             # Определяем session_string
-            if is_public:
-                session_string = self.session_string
-            else:
-                async with aiosqlite.connect(db_path) as db:
-                    cursor = await db.execute(
-                        "SELECT session_string FROM linked_accounts WHERE phone_number = ?",
-                        (phone_number,)
-                    )
-                    result = await cursor.fetchone()
-                    if not result:
-                        logger.error(f"Не найден session_string для аккаунта {phone_number}")
-                        return None
-                    session_string = result[0]
+            session_string = await self._resolve_session_string(is_public, phone_number, db_path)
             if not session_string:
                 logger.error("Нет session_string для получения постов")
                 return None
@@ -652,18 +658,7 @@ class PostScheduler:
                         stream_id, donor, targets_str, last_id, is_public, phone, _freshness_unused = stream
                         logger.info(f"Обрабатываем поток репостов {stream_id}: донор={donor}, публичный={is_public}")
                         # Определяем session для использования
-                        if is_public or not phone:
-                            session_string = self.session_string
-                        else:
-                            cursor = await db.execute(
-                                "SELECT session_string FROM linked_accounts WHERE phone_number = ?",
-                                (phone,)
-                            )
-                            result = await cursor.fetchone()
-                            if not result:
-                                logger.warning(f"Не найден session_string для телефона {phone}")
-                                continue
-                            session_string = result[0]
+                        session_string = await self._resolve_session_string(bool(is_public), phone, db_file)
                         if not session_string:
                             logger.warning(f"Нет session_string для потока {stream_id}")
                             continue
