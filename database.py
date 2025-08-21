@@ -224,7 +224,7 @@ async def fix_outdated_random_post_times(db_path: str):
                     await db.execute('''
                         DELETE FROM posts 
                         WHERE random_post_id = ? AND (scheduled_time < ? OR is_published = 1)
-                    ''', (post_id, week_ago))
+                    ''', (post_id, week_ago.isoformat()))
                     
                     logger.info("Исправлены времена для рандомного поста", extra={"post_id": post_id})
                     
@@ -642,7 +642,7 @@ async def cleanup_past_posts(db_path: str):
             # Удаляем посты с прошедшим временем
             cursor = await db.execute('''
                 DELETE FROM posts 
-                WHERE scheduled_time < ? AND is_published = 0
+                WHERE scheduled_time < ? AND is_published = 0 AND content_type != 'random'
             ''', (now.isoformat(),))
             deleted_posts = cursor.rowcount
             
