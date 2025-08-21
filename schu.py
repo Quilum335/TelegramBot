@@ -142,7 +142,7 @@ class PostScheduler:
                         self._last_backfill_time = now
                 except Exception:
                     pass
-                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+                await asyncio.sleep(max(5, int(getattr(Config, 'RANDOM_POST_CHECK_INTERVAL', 15))))  # Интервал из конфигурации
             except Exception as e:
                 logger.error(f"Ошибка в цикле планировщика: {e}")
                 await asyncio.sleep(60)
@@ -410,6 +410,20 @@ class PostScheduler:
 
                             # Публикуем подобранный контент
                             await self.publish_post_to_channel(post_data, channel_id)
+                            # Лог запаздывания публикации относительно расписания
+                            try:
+                                delay_sec = 0
+                                try:
+                                    if isinstance(sched_time, str):
+                                        sched_dt_for_log = datetime.fromisoformat(sched_time)
+                                    else:
+                                        sched_dt_for_log = datetime.fromisoformat(str(sched_time))
+                                    delay_sec = max(0, int((datetime.now() - sched_dt_for_log).total_seconds()))
+                                except Exception:
+                                    delay_sec = -1
+                                logger.info(f"Рандомный пост {post_id} в {channel_id} задержка={delay_sec}s от планового времени")
+                            except Exception:
+                                pass
                             await db.execute(
                                 "UPDATE posts SET is_published = 1, last_post_time = ? WHERE id = ?",
                                 (datetime.now().isoformat(), post_id)
@@ -419,13 +433,14 @@ class PostScheduler:
                                 "UPDATE random_posts SET last_post_time = ? WHERE id = ?",
                                 (datetime.now().isoformat(), stream_id)
                             )
+                            now_iso = datetime.now().isoformat()
                             cur = await db.execute(
                                 """
                                 SELECT scheduled_time FROM posts
-                                WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > datetime('now','localtime')
+                                WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > ?
                                 ORDER BY scheduled_time ASC
                                 """,
-                                (stream_id,)
+                                (stream_id, now_iso)
                             )
                             union_rows = await cur.fetchall()
                             union_times = []
@@ -1147,10 +1162,10 @@ class PostScheduler:
                     cur = await db.execute(
                         """
                         SELECT scheduled_time FROM posts
-                        WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > datetime('now','localtime')
+                        WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > ?
                         ORDER BY scheduled_time ASC
                         """,
-                        (stream_id,)
+                        (stream_id, datetime.now().isoformat())
                     )
                     union_rows = await cur.fetchall()
                     union_times = []
