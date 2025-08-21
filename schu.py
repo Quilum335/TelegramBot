@@ -20,27 +20,11 @@ from typing import Dict, Optional
 
 from config import Config
 from database import get_user_db_path, safe_json_loads
-from utils import clean_post_content
+from utils import clean_post_content, clean_telegram_links
 
 logger = logging.getLogger(__name__)
 
-def clean_telegram_links(text):
-    """Удаляет ссылки/упоминания телеграм-каналов из текста, сохраняя исходные абзацы и переносы.
-    - Удаляет t.me/telegram.me ссылки
-    - Удаляет @username как отдельные токены
-    - Не схлопывает пробелы и не меняет переводы строк
-    """
-    if not text:
-        return text
-    
-    # Удаляем ссылки на Telegram каналы/приглашения в любом месте текста
-    text = re.sub(r'(https?://)?t(?:elegram)?\.me/[A-Za-z0-9_+/]+', '', text)
-    
-    # Удаляем @username, но только когда это отдельный токен (не часть email)
-    text = re.sub(r'(?<!\S)@[A-Za-z0-9_]{3,}(?!\S)', '', text)
-    
-    # Возвращаем как есть, чтобы сохранить форматирование/абзацы
-    return text
+# clean_telegram_links теперь находится в utils.clean_telegram_links
 
 class PostScheduler:
     def __init__(self, bot: Bot):
@@ -170,18 +154,23 @@ class PostScheduler:
                         logger.info(f"Публикация поста {post_id} в {channel_id} (тип={content_type}, время={scheduled_time})")
                         try:
                             cleaned_content = clean_telegram_links(content) if content else ""
+                            post_data = None
                             if content_type == "text":
-                                await self.bot.send_message(channel_id, cleaned_content)
+                                post_data = {"type": "text", "text": cleaned_content, "media": None, "caption": None}
                             elif content_type == "photo":
-                                await self.bot.send_photo(channel_id, media_id, caption=cleaned_content)
+                                post_data = {"type": "photo", "text": None, "media": media_id, "caption": cleaned_content}
                             elif content_type == "video":
-                                await self.bot.send_video(channel_id, media_id, caption=cleaned_content)
+                                post_data = {"type": "video", "text": None, "media": media_id, "caption": cleaned_content}
                             elif content_type == "repost":
-                                parts = content.split("_")
-                                if len(parts) >= 3:
+                                parts = str(content).split("_")
+                                if len(parts) >= 3 and str(parts[1]).lstrip("-").isdigit() and str(parts[2]).isdigit():
                                     source_channel_id = int(parts[1])
                                     source_post_id = int(parts[2])
                                     await self.bot.forward_message(channel_id, source_channel_id, source_post_id)
+                                else:
+                                    logger.warning(f"Некорректные данные репоста для поста {post_id}: {content}")
+                            if post_data:
+                                await self.publish_post_to_channel(post_data, channel_id)
                             # Отмечаем пост как опубликованный
                             await db.execute(
                                 "UPDATE posts SET is_published = 1, last_post_time = ? WHERE id = ?",
@@ -614,6 +603,56 @@ class PostScheduler:
                         media_input = media_obj
                     caption = post_data.get('caption') or (post_data.get('text')[:1024] if post_data.get('text') else None)
                     await self.bot.send_video(channel_id, media_input, caption=caption)
+                elif post_data['type'] == 'document':
+                    media_obj = post_data['media']
+                    try:
+                        if isinstance(media_obj, (bytes, bytearray)):
+                            media_input = BufferedInputFile(media_obj, filename="document.bin")
+                        elif isinstance(media_obj, BytesIO):
+                            media_input = BufferedInputFile(media_obj.getvalue(), filename="document.bin")
+                        else:
+                            media_input = media_obj
+                    except Exception:
+                        media_input = media_obj
+                    caption = post_data.get('caption') or (post_data.get('text')[:1024] if post_data.get('text') else None)
+                    await self.bot.send_document(channel_id, media_input, caption=caption)
+                elif post_data['type'] == 'audio':
+                    media_obj = post_data['media']
+                    try:
+                        if isinstance(media_obj, (bytes, bytearray)):
+                            media_input = BufferedInputFile(media_obj, filename="audio.mp3")
+                        elif isinstance(media_obj, BytesIO):
+                            media_input = BufferedInputFile(media_obj.getvalue(), filename="audio.mp3")
+                        else:
+                            media_input = media_obj
+                    except Exception:
+                        media_input = media_obj
+                    caption = post_data.get('caption') or (post_data.get('text')[:1024] if post_data.get('text') else None)
+                    await self.bot.send_audio(channel_id, media_input, caption=caption)
+                elif post_data['type'] == 'voice':
+                    media_obj = post_data['media']
+                    try:
+                        if isinstance(media_obj, (bytes, bytearray)):
+                            media_input = BufferedInputFile(media_obj, filename="voice.ogg")
+                        elif isinstance(media_obj, BytesIO):
+                            media_input = BufferedInputFile(media_obj.getvalue(), filename="voice.ogg")
+                        else:
+                            media_input = media_obj
+                    except Exception:
+                        media_input = media_obj
+                    await self.bot.send_voice(channel_id, media_input)
+                elif post_data['type'] == 'sticker':
+                    media_obj = post_data['media']
+                    try:
+                        if isinstance(media_obj, (bytes, bytearray)):
+                            media_input = BufferedInputFile(media_obj, filename="sticker.webp")
+                        elif isinstance(media_obj, BytesIO):
+                            media_input = BufferedInputFile(media_obj.getvalue(), filename="sticker.webp")
+                        else:
+                            media_input = media_obj
+                    except Exception:
+                        media_input = media_obj
+                    await self.bot.send_sticker(channel_id, media_input)
             except Exception as e:
                 logger.error(f"Ошибка публикации в канал {channel_id}: {e}")
                 raise
@@ -735,220 +774,217 @@ class PostScheduler:
                     new_messages.append(message)
             logger.info(f"Найдено {len(new_messages)} новых сообщений в {donor_channel}")
             # Публикуем новые сообщения
-            for message in reversed(new_messages):
-                for target_channel in target_channels:
-                    try:
-                        # Сначала обрабатываем медиа с подписью, затем чистый текст
-                        if message.photo:
-                            caption = clean_telegram_links(message.caption or "")
-                            # Дедуп резервация
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "photo", "caption": caption, "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат photo для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_photo(target_channel, BufferedInputFile(data, filename="photo.jpg"), caption=caption)
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_photo(target_channel, BufferedInputFile(data_obj, filename="photo.jpg"), caption=caption)
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_photo(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "photo.jpg"), caption=caption)
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки фото в {target_channel}: {e}")
-                            finally:
+            async with aiosqlite.connect(db_path) as db:
+                for message in reversed(new_messages):
+                    for target_channel in target_channels:
+                        try:
+                            post_data = None
+                            if message.photo:
+                                caption = clean_telegram_links(message.caption or "")
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
+                                    fingerprint = self._make_post_fingerprint({"type": "photo", "caption": caption, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
                                 except Exception:
-                                    pass
-                        elif message.video:
-                            caption = clean_telegram_links(message.caption or "")
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "video", "caption": caption, "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат video для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_video(target_channel, BufferedInputFile(data, filename="video.mp4"), caption=caption)
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_video(target_channel, BufferedInputFile(data_obj, filename="video.mp4"), caption=caption)
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_video(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "video.mp4"), caption=caption)
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки видео в {target_channel}: {e}")
-                            finally:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат photo для {target_channel}")
+                                    continue
+                                data_obj = None
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
-                                except Exception:
-                                    pass
-                        elif message.document:
-                            caption = clean_telegram_links(message.caption or "")
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "document", "caption": caption, "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат document для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_document(target_channel, BufferedInputFile(data, filename="document.bin"), caption=caption)
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_document(target_channel, BufferedInputFile(data_obj, filename="document.bin"), caption=caption)
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_document(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "document.bin"), caption=caption)
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки документа в {target_channel}: {e}")
-                            finally:
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        # file path
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "photo", "media": media_input, "caption": caption, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки фото в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.video:
+                                caption = clean_telegram_links(message.caption or "")
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
+                                    fingerprint = self._make_post_fingerprint({"type": "video", "caption": caption, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
                                 except Exception:
-                                    pass
-                        elif message.audio:
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "audio", "caption": clean_telegram_links(message.caption or ""), "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат audio для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename="audio.mp3"), caption=clean_telegram_links(message.caption or ""))
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data_obj, filename="audio.mp3"), caption=clean_telegram_links(message.caption or ""))
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "audio.mp3"), caption=clean_telegram_links(message.caption or ""))
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки аудио в {target_channel}: {e}")
-                            finally:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат video для {target_channel}")
+                                    continue
+                                data_obj = None
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
-                                except Exception:
-                                    pass
-                        elif message.voice:
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "voice", "caption": None, "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат voice для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_voice(target_channel, BufferedInputFile(data, filename="voice.ogg"))
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_voice(target_channel, BufferedInputFile(data_obj, filename="voice.ogg"))
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_voice(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "voice.ogg"))
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки голосового в {target_channel}: {e}")
-                            finally:
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "video", "media": media_input, "caption": caption, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки видео в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.document:
+                                caption = clean_telegram_links(message.caption or "")
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
+                                    fingerprint = self._make_post_fingerprint({"type": "document", "caption": caption, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
                                 except Exception:
-                                    pass
-                        elif message.sticker:
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "sticker", "caption": None, "text": None})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат sticker для {target_channel}")
-                                continue
-                            data_obj = None
-                            try:
-                                data_obj = await client.download_media(message, in_memory=True)
-                                from io import BytesIO
-                                if isinstance(data_obj, BytesIO):
-                                    data = data_obj.getvalue()
-                                    await self.bot.send_sticker(target_channel, BufferedInputFile(data, filename="sticker.webp"))
-                                elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_sticker(target_channel, BufferedInputFile(data_obj, filename="sticker.webp"))
-                                else:
-                                    with open(str(data_obj), 'rb') as f:
-                                        data = f.read()
-                                    await self.bot.send_sticker(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "sticker.webp"))
-                            except Exception as e:
-                                logger.error(f"Ошибка отправки стикера в {target_channel}: {e}")
-                            finally:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат document для {target_channel}")
+                                    continue
+                                data_obj = None
                                 try:
-                                    if hasattr(data_obj, 'close'):
-                                        data_obj.close()
-                                    elif isinstance(data_obj, str) and os.path.exists(data_obj):
-                                        os.remove(data_obj)
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "document", "media": media_input, "caption": caption, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки документа в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.audio:
+                                caption = clean_telegram_links(message.caption or "")
+                                try:
+                                    fingerprint = self._make_post_fingerprint({"type": "audio", "caption": caption, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
                                 except Exception:
-                                    pass
-                        elif message.text:
-                            cleaned_text = clean_telegram_links(message.text)
-                            try:
-                                fingerprint = self._make_post_fingerprint({"type": "text", "caption": None, "text": cleaned_text})
-                                ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
-                            except Exception:
-                                ok = True
-                            if not ok:
-                                logger.info(f"Пропущен дубликат text для {target_channel}")
-                                continue
-                            await self.bot.send_message(target_channel, cleaned_text)
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        logger.error(f"Ошибка репоста в {target_channel}: {e}")
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат audio для {target_channel}")
+                                    continue
+                                data_obj = None
+                                try:
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "audio", "media": media_input, "caption": caption, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки аудио в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.voice:
+                                try:
+                                    fingerprint = self._make_post_fingerprint({"type": "voice", "caption": None, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
+                                except Exception:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат voice для {target_channel}")
+                                    continue
+                                data_obj = None
+                                try:
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "voice", "media": media_input, "caption": None, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки голосового в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.sticker:
+                                try:
+                                    fingerprint = self._make_post_fingerprint({"type": "sticker", "caption": None, "text": None})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
+                                except Exception:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат sticker для {target_channel}")
+                                    continue
+                                data_obj = None
+                                try:
+                                    data_obj = await client.download_media(message, in_memory=True)
+                                    if isinstance(data_obj, BytesIO):
+                                        media_input = data_obj
+                                    elif isinstance(data_obj, (bytes, bytearray)):
+                                        media_input = BytesIO(data_obj)
+                                    else:
+                                        with open(str(data_obj), 'rb') as f:
+                                            media_input = BytesIO(f.read())
+                                    post_data = {"type": "sticker", "media": media_input, "caption": None, "text": None}
+                                    await self.publish_post_to_channel(post_data, target_channel)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки стикера в {target_channel}: {e}")
+                                finally:
+                                    try:
+                                        if hasattr(data_obj, 'close'):
+                                            data_obj.close()
+                                        elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                            os.remove(data_obj)
+                                    except Exception:
+                                        pass
+                            elif message.text:
+                                cleaned_text = clean_telegram_links(message.text)
+                                try:
+                                    fingerprint = self._make_post_fingerprint({"type": "text", "caption": None, "text": cleaned_text})
+                                    ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
+                                except Exception:
+                                    ok = True
+                                if not ok:
+                                    logger.info(f"Пропущен дубликат text для {target_channel}")
+                                    continue
+                                post_data = {"type": "text", "text": cleaned_text, "media": None, "caption": None}
+                                await self.publish_post_to_channel(post_data, target_channel)
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"Ошибка репоста в {target_channel}: {e}")
             # Обновляем last_message_id
             if new_messages:
                 max_id = max(msg.id for msg in new_messages)
